@@ -6,6 +6,7 @@
 """
 
 import os
+import json
 import threading
 import time
 import tkinter as tk
@@ -293,6 +294,18 @@ class FileTransferApp(ctk.CTk):
         self.local_ip = get_local_ip()
         self.hostname = get_hostname()
 
+        # ── 載入設定檔 ──
+        self.config_file = "config.json"
+        self.save_dir = str(Path.home() / "Downloads")
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    if "save_dir" in config and os.path.isdir(config["save_dir"]):
+                        self.save_dir = config["save_dir"]
+        except Exception as e:
+            print(f"Error loading config: {e}")
+
         # ── 網路服務 ──
         self.discovery = DiscoveryService(
             transfer_port=TRANSFER_PORT,
@@ -304,6 +317,7 @@ class FileTransferApp(ctk.CTk):
             on_progress=self._on_transfer_progress,
             on_complete=self._on_transfer_complete,
         )
+        self.transfer_server.set_save_directory(self.save_dir)
         self.transfer_client = TransferClient(
             on_progress=self._on_transfer_progress,
             on_complete=self._on_transfer_complete,
@@ -481,9 +495,12 @@ class FileTransferApp(ctk.CTk):
             text_color=COLORS["text_secondary"],
         ).pack(side="left")
 
+        display_path = self.save_dir
+        if len(display_path) > 40:
+            display_path = "..." + display_path[-37:]
         self.save_path_label = ctk.CTkLabel(
             save_inner,
-            text=str(Path.home() / "Downloads"),
+            text=display_path,
             font=ctk.CTkFont(size=12),
             text_color=COLORS["accent_light"],
         )
@@ -583,11 +600,24 @@ class FileTransferApp(ctk.CTk):
             parent=self,
         )
         if path:
+            self.save_dir = path
             self.transfer_server.set_save_directory(path)
             display = path
             if len(display) > 40:
                 display = "..." + display[-37:]
             self.save_path_label.configure(text=display)
+            
+            # 儲存到設定檔
+            try:
+                config = {}
+                if os.path.exists(self.config_file):
+                    with open(self.config_file, "r", encoding="utf-8") as f:
+                        config = json.load(f)
+                config["save_dir"] = path
+                with open(self.config_file, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                print(f"Error saving config: {e}")
 
     def _send_files(self):
         """傳送檔案"""
