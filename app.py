@@ -290,6 +290,9 @@ class FileTransferApp(ctk.CTk):
         self.selected_device: DeviceInfo | None = None
         self.selected_files: list[str] = []
         self.transfer_widgets: dict[str, TransferItemWidget] = {}
+        self._closing = False
+        self._cached_devices: dict = {}
+        self._ip_check_counter = 0
 
         self.local_ip = get_local_ip()
         self.hostname = get_hostname()
@@ -670,13 +673,18 @@ class FileTransferApp(ctk.CTk):
 
     def _on_devices_changed(self, devices: dict):
         """裝置列表變更（從背景執行緒呼叫）"""
+        if self._closing:
+            return
         # 使用 after 切換回主執行緒
         self.after(0, self._update_device_list, devices)
 
     def _update_device_list(self, devices: dict = None):
         """更新裝置列表 UI"""
         if devices is None:
-            devices = {d.ip: d for d in self.discovery.get_devices()}
+            devices = self._cached_devices if self._cached_devices else {
+                d.ip: d for d in self.discovery.get_devices()
+            }
+        self._cached_devices = devices
 
         # 更新計數
         self.device_count_label.configure(text=str(len(devices)))
@@ -718,6 +726,9 @@ class FileTransferApp(ctk.CTk):
 
     def _on_transfer_request(self, task: TransferTask, accept_func, reject_func):
         """收到傳輸請求（從背景執行緒呼叫）"""
+        if self._closing:
+            reject_func()
+            return
         self.after(0, self._show_transfer_request, task, accept_func, reject_func)
 
     def _show_transfer_request(self, task: TransferTask, accept_func, reject_func):
@@ -749,10 +760,14 @@ class FileTransferApp(ctk.CTk):
 
     def _on_transfer_progress(self, task: TransferTask):
         """傳輸進度更新（從背景執行緒呼叫）"""
+        if self._closing:
+            return
         self.after(0, self._update_transfer_widget, task)
 
     def _on_transfer_complete(self, task: TransferTask):
         """傳輸完成（從背景執行緒呼叫）"""
+        if self._closing:
+            return
         self.after(0, self._update_transfer_widget, task)
 
     def _add_transfer_widget(self, task: TransferTask):
@@ -807,19 +822,26 @@ class FileTransferApp(ctk.CTk):
 
     def _update_ui_loop(self):
         """定期更新 UI（每秒）"""
-        # 更新本機 IP（可能會變）
-        new_ip = get_local_ip()
-        if new_ip != self.local_ip:
-            self.local_ip = new_ip
-            self.info_label.configure(
-                text=f"🖥 {self.hostname}   •   🌐 {self.local_ip}"
-            )
+        if self._closing:
+            return
+
+        # 更新本機 IP（每 30 秒檢查一次）
+        self._ip_check_counter += 1
+        if self._ip_check_counter >= 30:
+            self._ip_check_counter = 0
+            new_ip = get_local_ip()
+            if new_ip != self.local_ip:
+                self.local_ip = new_ip
+                self.info_label.configure(
+                    text=f"🖥 {self.hostname}   •   🌐 {self.local_ip}"
+                )
 
         # 繼續排程
         self.after(1000, self._update_ui_loop)
 
     def _on_close(self):
         """關閉視窗"""
+        self._closing = True
         self.discovery.stop()
         self.transfer_server.stop()
         self.destroy()

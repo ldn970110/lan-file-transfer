@@ -176,7 +176,11 @@ class TransferServer:
 
     def _handle_connection(self, conn: socket.socket, addr: tuple):
         """處理單一傳輸連線"""
+        task_id = None
         try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.settimeout(30.0)
 
             # 1. 接收傳輸請求
@@ -261,7 +265,7 @@ class TransferServer:
             self._receive_files(conn, task)
 
         except Exception as e:
-            if task_id in self._tasks:
+            if task_id is not None and task_id in self._tasks:
                 self._tasks[task_id].status = STATUS_FAILED
                 self._tasks[task_id].error_message = str(e)
                 if self.on_complete:
@@ -276,6 +280,7 @@ class TransferServer:
         """接收檔案資料"""
         file_handles: dict[int, object] = {}
         file_sizes: dict[int, int] = {}
+        last_progress_time = 0.0
 
         try:
             while not task.is_cancelled:
@@ -316,10 +321,12 @@ class TransferServer:
                         # 確保目錄存在
                         os.makedirs(os.path.dirname(partial_path) or ".", exist_ok=True)
 
-                        # 開啟部分檔案
-                        fh = open(partial_path, "ab" if offset > 0 else "wb")
-                        if offset > 0:
+                        # 開啟部分檔案（用 r+b 支援 seek，避免 append 模式忽略 seek）
+                        if offset > 0 and os.path.exists(partial_path):
+                            fh = open(partial_path, "r+b")
                             fh.seek(offset)
+                        else:
+                            fh = open(partial_path, "wb")
                         file_handles[file_idx] = fh
                         file_sizes[file_idx] = task.files[file_idx]["size"]
 
@@ -335,8 +342,11 @@ class TransferServer:
                     remaining = task.total_size - task.transferred
                     task.eta = task.speed_tracker.get_eta(remaining)
 
-                    if self.on_progress:
-                        self.on_progress(task)
+                    now = time.time()
+                    if now - last_progress_time >= 0.1:
+                        last_progress_time = now
+                        if self.on_progress:
+                            self.on_progress(task)
 
                 elif msg_type == MSG_FILE_DONE:
                     file_idx = msg["file_idx"]
@@ -485,6 +495,9 @@ class TransferClient:
 
             # 1. 連線到接收端
             conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.settimeout(30.0)
             conn.connect((target_ip, target_port))
 
@@ -532,6 +545,7 @@ class TransferClient:
             conn.settimeout(60.0)
 
             # 5. 逐檔傳送
+            last_progress_time = 0.0
             for idx, f_info in enumerate(task.files):
                 if task.is_cancelled:
                     cancel_msg = {"type": MSG_TRANSFER_CANCEL}
@@ -593,8 +607,11 @@ class TransferClient:
                         remaining = task.total_size - task.transferred
                         task.eta = task.speed_tracker.get_eta(remaining)
 
-                        if self.on_progress:
-                            self.on_progress(task)
+                        now = time.time()
+                        if now - last_progress_time >= 0.1:
+                            last_progress_time = now
+                            if self.on_progress:
+                                self.on_progress(task)
 
                 # 通知此檔案傳送完畢
                 done_msg = {"type": MSG_FILE_DONE, "file_idx": idx}

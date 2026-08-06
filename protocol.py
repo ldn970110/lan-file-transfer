@@ -13,7 +13,7 @@ DISCOVERY_PORT = 50800      # UDP 裝置發現埠
 TRANSFER_PORT  = 50801      # TCP 檔案傳輸埠
 
 # ── 傳輸參數 ──────────────────────────────────────────
-CHUNK_SIZE     = 65536       # 64 KB 分塊大小
+CHUNK_SIZE     = 1048576     # 1 MB 分塊大小
 BROADCAST_INTERVAL = 3       # 裝置發現廣播間隔（秒）
 DEVICE_TIMEOUT     = 10      # 裝置離線判定時間（秒）
 
