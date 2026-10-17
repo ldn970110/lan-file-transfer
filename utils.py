@@ -7,37 +7,19 @@
 import hashlib
 import socket
 import time
+from collections import deque
 from pathlib import Path
 
 from protocol import CHUNK_SIZE
 
 
-def compute_sha256(filepath: str | Path, offset: int = 0) -> str:
-    """
-    計算檔案的 SHA-256 雜湊值
-
-    Args:
-        filepath: 檔案路徑
-        offset: 起始偏移量（預設 0，計算整個檔案）
-
-    Returns:
-        十六進位制的 SHA-256 雜湊字串
-    """
+def compute_sha256(filepath: str | Path) -> str:
+    """計算整個檔案的 SHA-256 雜湊值（十六進位字串）"""
     sha = hashlib.sha256()
     with open(filepath, "rb") as f:
-        if offset > 0:
-            f.seek(offset)
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
+        while chunk := f.read(CHUNK_SIZE):
             sha.update(chunk)
     return sha.hexdigest()
-
-
-def compute_sha256_full(filepath: str | Path) -> str:
-    """計算整個檔案的 SHA-256 雜湊值"""
-    return compute_sha256(filepath, offset=0)
 
 
 def format_size(size_bytes: int) -> str:
@@ -110,19 +92,24 @@ def get_local_ip() -> str:
     try:
         # 建立一個 UDP socket 連線到外部位址來取得本機 IP
         # 不會真正發送資料
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.5)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
         return "127.0.0.1"
 
 
 def get_hostname() -> str:
     """取得本機電腦名稱"""
     return socket.gethostname()
+
+
+def truncate_left(text: str, max_len: int) -> str:
+    """過長時保留尾端，前面以 "..." 取代（適合顯示路徑）"""
+    if len(text) <= max_len:
+        return text
+    return "..." + text[-(max_len - 3):]
 
 
 def collect_files(paths: list[str]) -> list[dict]:
@@ -143,25 +130,26 @@ def collect_files(paths: list[str]) -> list[dict]:
     """
     file_list = []
 
+    def add(file_path: Path, rel_path: str):
+        try:
+            size = file_path.stat().st_size
+        except OSError:
+            return  # 無法讀取的檔案略過
+        file_list.append({
+            "abs_path": str(file_path),
+            "rel_path": rel_path,
+            "size": size,
+        })
+
     for path_str in paths:
         p = Path(path_str)
         if p.is_file():
-            file_list.append({
-                "abs_path": str(p),
-                "rel_path": p.name,
-                "size": p.stat().st_size,
-            })
+            add(p, p.name)
         elif p.is_dir():
             # 遞迴展開資料夾，以資料夾名稱作為根目錄
-            base_name = p.name
             for child in p.rglob("*"):
                 if child.is_file():
-                    rel = str(Path(base_name) / child.relative_to(p))
-                    file_list.append({
-                        "abs_path": str(child),
-                        "rel_path": rel,
-                        "size": child.stat().st_size,
-                    })
+                    add(child, str(Path(p.name) / child.relative_to(p)))
 
     return file_list
 
@@ -180,7 +168,7 @@ class SpeedTracker:
             window_size: 滑動視窗大小（秒）
         """
         self.window_size = window_size
-        self.samples: list[tuple[float, int]] = []  # (timestamp, bytes)
+        self.samples: deque[tuple[float, int]] = deque()  # (timestamp, bytes)
         self.total_bytes = 0
 
     def update(self, bytes_count: int):
@@ -191,7 +179,8 @@ class SpeedTracker:
 
         # 移除過舊的樣本
         cutoff = now - self.window_size
-        self.samples = [(t, b) for t, b in self.samples if t >= cutoff]
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
 
     def get_speed(self) -> float:
         """

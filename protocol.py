@@ -6,6 +6,7 @@ TCP 訊息使用 4-byte 長度前綴 + JSON 內容的格式，確保邊界正確
 """
 
 import json
+import socket
 import struct
 
 # ── 埠號 ──────────────────────────────────────────────
@@ -14,6 +15,7 @@ TRANSFER_PORT  = 50801      # TCP 檔案傳輸埠
 
 # ── 傳輸參數 ──────────────────────────────────────────
 CHUNK_SIZE     = 1048576     # 1 MB 分塊大小
+SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
 BROADCAST_INTERVAL = 3       # 裝置發現廣播間隔（秒）
 DEVICE_TIMEOUT     = 10      # 裝置離線判定時間（秒）
 
@@ -39,6 +41,12 @@ STATUS_RECEIVING = "receiving"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED    = "failed"
 STATUS_CANCELLED = "cancelled"
+
+FINISHED_STATUSES = (STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED)
+
+# ── 傳輸方向 ──────────────────────────────────────────
+DIRECTION_SEND    = "send"
+DIRECTION_RECEIVE = "receive"
 
 
 # ── 訊息建構函式 ──────────────────────────────────────
@@ -99,7 +107,29 @@ def build_transfer_cancel() -> dict:
     return {"type": MSG_TRANSFER_CANCEL}
 
 
+def build_file_chunk(file_idx: int, offset: int, chunk_size: int) -> dict:
+    """建構資料塊標頭訊息（本體緊接在後以原始位元組傳送）"""
+    return {
+        "type": MSG_FILE_CHUNK,
+        "file_idx": file_idx,
+        "offset": offset,
+        "chunk_size": chunk_size,
+    }
+
+
+def build_file_done(file_idx: int) -> dict:
+    """建構單一檔案傳送完畢訊息"""
+    return {"type": MSG_FILE_DONE, "file_idx": file_idx}
+
+
 # ── TCP 訊息序列化（4-byte 長度前綴） ─────────────────
+
+def configure_socket(sock: socket.socket):
+    """設定傳輸用 TCP socket 的緩衝區與 Nagle 演算法"""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
 
 def encode_message(msg: dict) -> bytes:
     """
@@ -112,6 +142,11 @@ def encode_message(msg: dict) -> bytes:
     return header + data
 
 
+def send_message(sock, msg: dict):
+    """序列化並傳送一則完整訊息"""
+    sock.sendall(encode_message(msg))
+
+
 def recv_message(sock) -> dict | None:
     """
     從 TCP socket 接收一則完整訊息
@@ -120,7 +155,7 @@ def recv_message(sock) -> dict | None:
         解析後的訊息字典，或 None（若連線中斷）
     """
     # 讀取 4-byte 長度前綴
-    header = _recv_exact(sock, 4)
+    header = recv_exact(sock, 4)
     if header is None:
         return None
 
@@ -129,19 +164,19 @@ def recv_message(sock) -> dict | None:
         return None
 
     # 讀取訊息本體
-    data = _recv_exact(sock, length)
+    data = recv_exact(sock, length)
     if data is None:
         return None
 
     return json.loads(data.decode("utf-8"))
 
 
-def _recv_exact(sock, n: int) -> bytes | None:
-    """從 socket 精確讀取 n 個位元組"""
+def recv_exact(sock, n: int) -> bytes | None:
+    """從 socket 精確讀取 n 個位元組，連線中斷時返回 None"""
     buf = bytearray()
     while len(buf) < n:
         try:
-            chunk = sock.recv(n - len(buf))
+            chunk = sock.recv(min(n - len(buf), CHUNK_SIZE))
         except (ConnectionError, OSError):
             return None
         if not chunk:

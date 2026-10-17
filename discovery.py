@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from protocol import (
     DISCOVERY_PORT,
+    TRANSFER_PORT,
     BROADCAST_INTERVAL,
     DEVICE_TIMEOUT,
     MSG_DISCOVER,
@@ -63,19 +64,19 @@ class DiscoveryService:
         self.devices: dict[str, DeviceInfo] = {}
         self._lock = threading.Lock()
 
-        self._running = False
-        self._broadcast_thread: threading.Thread | None = None
-        self._listen_thread: threading.Thread | None = None
-        self._cleanup_thread: threading.Thread | None = None
-
+        self._stop_event = threading.Event()
         self._sock: socket.socket | None = None
+
+    @property
+    def _running(self) -> bool:
+        return self._sock is not None and not self._stop_event.is_set()
 
     def start(self):
         """啟動發現服務"""
         if self._running:
             return
 
-        self._running = True
+        self._stop_event.clear()
 
         # 建立 UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -91,28 +92,21 @@ class DiscoveryService:
         self._sock.settimeout(1.0)
 
         # 啟動背景執行緒
-        self._broadcast_thread = threading.Thread(
-            target=self._broadcast_loop, daemon=True, name="discovery-broadcast"
-        )
-        self._listen_thread = threading.Thread(
-            target=self._listen_loop, daemon=True, name="discovery-listen"
-        )
-        self._cleanup_thread = threading.Thread(
-            target=self._cleanup_loop, daemon=True, name="discovery-cleanup"
-        )
-
-        self._broadcast_thread.start()
-        self._listen_thread.start()
-        self._cleanup_thread.start()
+        for target, name in (
+            (self._broadcast_loop, "discovery-broadcast"),
+            (self._listen_loop, "discovery-listen"),
+            (self._cleanup_loop, "discovery-cleanup"),
+        ):
+            threading.Thread(target=target, daemon=True, name=name).start()
 
     def stop(self):
         """停止發現服務"""
-        self._running = False
+        self._stop_event.set()
 
         if self._sock:
             try:
                 self._sock.close()
-            except Exception:
+            except OSError:
                 pass
             self._sock = None
 
@@ -121,9 +115,17 @@ class DiscoveryService:
         with self._lock:
             return list(self.devices.values())
 
+    def _notify_changed(self):
+        if self.on_devices_changed:
+            with self._lock:
+                snapshot = self.devices.copy()
+            self.on_devices_changed(snapshot)
+
     def _broadcast_loop(self):
         """定期廣播自身存在"""
         while self._running:
+            # 網路可能切換，每次廣播前重新取得本機 IP
+            self.local_ip = get_local_ip()
             try:
                 msg = build_discover_message(
                     hostname=self.hostname,
@@ -133,28 +135,24 @@ class DiscoveryService:
                 data = json.dumps(msg, ensure_ascii=False).encode("utf-8")
 
                 # 廣播到所有子網
-                broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                broadcast_sock.sendto(data, ("<broadcast>", DISCOVERY_PORT))
-                broadcast_sock.close()
-
-            except Exception:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as broadcast_sock:
+                    broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    broadcast_sock.sendto(data, ("<broadcast>", DISCOVERY_PORT))
+            except OSError:
                 pass
 
-            # 等待下一次廣播
-            for _ in range(int(BROADCAST_INTERVAL * 10)):
-                if not self._running:
-                    return
-                time.sleep(0.1)
+            if self._stop_event.wait(BROADCAST_INTERVAL):
+                return
 
     def _listen_loop(self):
         """監聽來自其他裝置的廣播"""
         while self._running:
             try:
-                if self._sock is None:
+                sock = self._sock
+                if sock is None:
                     break
 
-                data, addr = self._sock.recvfrom(4096)
+                data, addr = sock.recvfrom(4096)
                 msg = json.loads(data.decode("utf-8"))
 
                 if msg.get("type") != MSG_DISCOVER:
@@ -169,7 +167,7 @@ class DiscoveryService:
                 device = DeviceInfo(
                     hostname=msg.get("hostname", "Unknown"),
                     ip=sender_ip,
-                    port=msg.get("port", 50801),
+                    port=msg.get("port", TRANSFER_PORT),
                     last_seen=time.time(),
                 )
 
@@ -179,8 +177,8 @@ class DiscoveryService:
                         changed = True
                     self.devices[sender_ip] = device
 
-                if changed and self.on_devices_changed:
-                    self.on_devices_changed(self.devices.copy())
+                if changed:
+                    self._notify_changed()
 
             except socket.timeout:
                 continue
@@ -191,12 +189,7 @@ class DiscoveryService:
 
     def _cleanup_loop(self):
         """定期清理逾時的裝置"""
-        while self._running:
-            time.sleep(DEVICE_TIMEOUT / 2)
-
-            if not self._running:
-                break
-
+        while not self._stop_event.wait(DEVICE_TIMEOUT / 2):
             now = time.time()
             changed = False
 
@@ -209,5 +202,5 @@ class DiscoveryService:
                     del self.devices[ip]
                     changed = True
 
-            if changed and self.on_devices_changed:
-                self.on_devices_changed(self.devices.copy())
+            if changed:
+                self._notify_changed()
